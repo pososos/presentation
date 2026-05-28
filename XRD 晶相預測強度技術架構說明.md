@@ -1,622 +1,246 @@
-# v6.4 MLOps 升級規格書
+# 水泥 XRD 晶相強度預測系統 — 技術架構說明
 
-## 目標
+## 1. 系統總覽
 
-在不重構檔案結構的前提下，為 v6.4 加入六項 MLOps 基礎設施，
-使其從「每次跑完看 console」升級到「可追溯、可測試、可偵測異常」。
+本系統從 XRD Rietveld 定量分析結果出發，經過特徵工程、自動特徵選擇、模型訓練與驗證、可解釋性分析、不確定性量化五個階段，最終輸出帶有信任等級的強度預測。系統架構分為兩個主要元件：特徵分析腳本（離線訓練）和預測腳本（線上推論）。
 
-## 基準代碼
-
-`cement_feature_analysis_v6_4.py`（2088 行）
-`cement_predict_v6_4.py`（218 行）
+數據規模：和平廠 40 筆、蘇澳廠 31 筆。預測目標：3 天、7 天、28 天抗壓強度（MPa）。
 
 ---
 
-## 修改一覽
+## 2. 數據流與管線架構
 
-| 編號 | 改善項 | 改動位置 | 新增行數 | 依賴 |
-|------|--------|----------|----------|------|
-| M1 | `if __name__` 保護 | L1462 前 | 2 行 | 無 |
-| M2 | 數據指紋 + pkl 版本化 | L1466 後, L2044 | ~15 行 | 無 |
-| M3 | config.yaml 分離 | L75-88, 新檔案 | ~40 行 | 無 |
-| M4 | experiment_log.csv | 主迴圈結尾 | ~35 行 | M2 |
-| M5 | feature_stats OOD 檢查 | pkl 存檔, 預測腳本 | ~30 行 | 無 |
-| M6 | test notebook | 新檔案 | ~120 行 | M1 |
-
-建議順序：M1 → M2 → M3 → M5 → M4 → M6
-
----
-
-## M1：`if __name__ == '__main__':` 保護
-
-### 問題
-
-目前 import `cement_feature_analysis_v6_4` 會立即執行全部 2088 行，
-包括 88 分鐘的主迴圈。這讓單獨測試函數變得不可能。
-
-### 修改
-
-在 L1459（`# 數據載入` 區塊的 `=====` 分隔線前）插入：
-
-```python
-# ============================================================
-# 以上為函數定義和常量，以下為主執行流程
-# ============================================================
-if __name__ == '__main__':
 ```
-
-然後將 L1462-2088 的所有代碼（從 `print("=" * 80)` 到檔案結尾）
-**縮排一層**（4 spaces）。
-
-### 注意
-
-TASKS、V51 字典定義（L1399-1428）和 compute_trust_grade（L1431-1448）
-以及 TRUST_LABELS（L1451-1456）要留在 `if __name__` **外面**，
-因為它們是常量/函數，測試時需要 import。
-
-精確的插入點：在 L1457（TRUST_LABELS 結束）之後、L1459 之前。
-
-```python
-TRUST_LABELS = {
-    'A': '✓ 可部署',
-    'B': '⚠ 可使用',
-    'C': '⚠ 實驗性',
-    'D': '✗ 不可靠',
-}
-
-
-# ============================================================
-# 主執行流程（import 時不執行）
-# ============================================================
-if __name__ == '__main__':
-
-    # ============================================================
-    # 數據載入
-    # ============================================================
-    print("=" * 80)
-    ...（原 L1462-2088 全部縮排 4 spaces）
-```
-
-### 驗證
-
-修改後直接執行 `python cement_feature_analysis_v6_4.py` 的行為
-和修改前完全一致。但在另一個 notebook 中：
-
-```python
-from cement_feature_analysis_v6_4 import compute_trust_grade
-# 不會觸發主迴圈
+Excel (XRD + 強度) 
+  → calculate_features（特徵工程，42+ 候選特徵）
+    → build_pool（特徵池過濾）
+      → greedy_forward（Ridge LOO 逐步選擇）
+        → Full Nested LOO（特徵 + 模型都在內層選擇）
+          → trust_mode 判定（A/B/C）
+            → 防過擬合特徵裁剪
+              → Optuna 超參數優化
+                → SHAP + Permutation + Interaction 三重驗證
+                  → 偏差量化 + Conformal 校準
+                    → Trust Grade 分級
+                      → STRATEGIES + pkl 存檔
 ```
 
 ---
 
-## M2：數據指紋 + pkl 版本化
+## 3. 特徵工程
 
-### 問題
+### 3.1 原始 XRD 特徵（10 個）
 
-pkl 檔名固定為 `cement_analysis_v6.4.pkl`，每次重訓覆蓋，
-無法追溯「這個 pkl 是用哪個版本的 Excel 訓練的」。
+C3S, C2S, C4AF, C3A_cubic, C3A_ortho, FreeLime, Calcite, Gypsum, Bassanite, Anhydrite。這些來自 Rietveld 精修的晶相含量（wt%）。
 
-### 修改
+### 3.2 工程特徵設計原理
 
-**步驟 1：計算數據指紋（L1474 之後，combined 建好後）**
+特徵工程基於 Portland 水泥化學的 Bogue 計算體系和水化反應動力學。
 
-```python
-    # ★ MLOps M2: 數據指紋
-    _data_hash = hashlib.md5(
-        pd.util.hash_pandas_object(combined).values.tobytes()
-    ).hexdigest()[:12]
-    _data_mtime = os.path.getmtime(FILE_PATH)
-    print(f"數據指紋: {_data_hash} (修改時間: "
-          f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(_data_mtime))})")
-```
+氧化物估算：從晶相含量反推 CaO, SiO₂, Al₂O₃, Fe₂O₃ 估計值。例如 `CaO_est = C3S×0.737 + C2S×0.651 + C3A_total×0.623 + C4AF×0.462 + FreeLime + Calcite×0.56`，基於各晶相的化學計量比。
 
-**步驟 2：pkl 檔名帶指紋和時間戳**
+水泥模數：LSF（石灰飽和因子）、IM（鐵率）、SM（矽率）是水泥工業標準的品質控制指標，直接影響熟料中各晶相的比例 [1]。
 
-修改 L88 的 `MODEL_SAVE_PATH`（在配置區塊）。因為 `_data_hash` 要到
-數據載入後才有值，所以改為在主迴圈中動態生成：
+比表面積交互項：`SSA_C3S = 比表面積 × C3S / 1000`。比表面積放大了 C3S 的水化反應速率，兩者的乘積比單獨使用任一指標更能預測早期強度 [2]。v6.4 的 SHAP 分析驗證了 SSA_C3S 在 3 天和平預測中佔 76.5% 的重要性。
 
-```python
-    # 在數據指紋計算後（上面的代碼之後）
-    _run_timestamp = time.strftime('%Y%m%d_%H%M')
-    MODEL_SAVE_PATH = (
-        f"/content/drive/MyDrive/台泥/AI/"
-        f"cement_v6.4_{_data_hash}_{_run_timestamp}.pkl"
-    )
-    # 同時保留一個固定名稱的 latest 連結
-    MODEL_LATEST_PATH = (
-        "/content/drive/MyDrive/台泥/AI/cement_analysis_v6.4.pkl"
-    )
-```
+C3A 品質指標：`C3A_quality = C3A_cubic / (C3A_cubic + 1.5×C3A_ortho)`。Cubic C3A 的水化反應速率高於 orthorhombic C3A，且受硫酸鹽/鹼比控制 [2]。權重 1.5 反映了 ortho 對早期強度的負面效應。
 
-**步驟 3：存入 pkl（修改 L2044 的 save_data）**
+水化熱估算：`Heat_est = 136×C3S/100 + 62×C2S/100 + 200×C3A_total/100 + 30×C4AF/100`，基於 Bogue 計算的各晶相水化熱係數（cal/g）[1]。
 
-在 save_data 字典中新增：
+硫酸鹽平衡：`SO3_deficit = max(0, 0.8×C3A_total − Sulfate_total)`。當硫酸鹽不足時，C3A 會發生不受控水化（flash set），影響強度發展 [3]。
 
-```python
-        'data_hash': _data_hash,
-        'data_path': FILE_PATH,
-        'data_mtime': _data_mtime,
-        'run_timestamp': _run_timestamp,
-        'version': 'v6.4',
-```
+### 3.3 前向兼容特徵
 
-存檔時同時寫兩個檔案：
+SO₃/Alkali 比（C-1）：`SO3_Alkali_ratio = Sulfate_total / Na2Oeq`。研究表明硫酸鹽-鹼比顯著影響 C3A 含量和多晶型，以及 Alite 晶體大小 [2]。僅在 Excel 中存在 K₂O 和 Na₂O 欄位時計算。
 
-```python
-    joblib.dump(save_data, MODEL_SAVE_PATH)
-    # 同時更新 latest
-    import shutil
-    shutil.copy2(MODEL_SAVE_PATH, MODEL_LATEST_PATH)
-    print(f"\n✓ 模型存檔: {MODEL_SAVE_PATH}")
-    print(f"  (latest → {MODEL_LATEST_PATH})")
-```
-
-### 驗證
-
-跑完後 Drive 上會出現兩個檔案：
-- `cement_v6.4_a3f2b1c9d4e5_20260519_1430.pkl`（帶指紋）
-- `cement_analysis_v6.4.pkl`（latest，預測腳本用）
+C3S 多晶型比例（C-2）：`C3S_M1_ratio = C3S_M1 / (C3S_M1 + C3S_M3)`。C3S 的 M1 多晶型在較低溫度下形成，影響早期水化行為和 portlandite 生成 [4]。C3S 的形成受硫酸鹽/鎂比和 Na₂Oeq 含量控制（而非 LSF），多晶型受硫酸鹽/(鎂+鹼) 比控制 [2]。僅在未來 Rietveld 精修區分 M1/M3 後生效。
 
 ---
 
-## M3：config.yaml 分離
+## 4. 驗證框架
 
-### 問題
+### 4.1 Full Nested LOO-CV
 
-超參數、路徑、開關散落在腳本頂部（L78-88），改一個參數要打開
-2088 行的腳本找位置。
+傳統的 K-fold 交叉驗證在小樣本下會產生嚴重的樂觀偏差。研究證實，K-fold CV 在小樣本下效能估計偏差顯著，而 Nested CV 和 train/test split 不論樣本大小都能產生穩健且無偏的效能估計 [5]。2026 年的 bias-resistant framework 進一步指出，傳統 CV 同時用於模型選擇和效能估計時，可能膨脹效能指標超過 20% [6]。
 
-### 新增檔案
+本系統的 Full Nested LOO 在每個外層迭代中完整執行三步：
 
-建立 `/content/drive/MyDrive/台泥/AI/config.yaml`：
+Step 1：相關性預過濾（保留 top 15 特徵，降低內層搜索空間）
+Step 2：在 train set 上執行 inner greedy forward（Ridge，最多 4 步，增量 R² < 0.005 則停止）
+Step 3：在選出的特徵上遍歷 6 個模型候選（Ridge, XGB, GB, CatBoost_Ordered, RF, ElasticNet），選最佳
 
-```yaml
-# cement ML pipeline config v6.4
-data:
-  file_path: "/content/drive/MyDrive/台泥/AI/水泥XRD(整理後).xlsx"
+輸出 Nested R² 作為真正無偏的泛化估計，同時統計特徵組合穩定性（各 fold 選出的特徵是否一致）和內層模型分布。
 
-training:
-  use_optuna: true
-  optuna_trials: 30
-  bootstrap_n: 200
-  shap_enabled: true
+### 4.2 Bootstrap 置信區間
 
-output:
-  shap_dir: "/content/drive/MyDrive/台泥/AI/shap_outputs/"
-  model_dir: "/content/drive/MyDrive/台泥/AI/"
-  experiment_log: "/content/drive/MyDrive/台泥/AI/experiment_log.csv"
-```
+200 次 bootstrap 重抽樣計算 R² 的 95% 置信區間。OOB（Out-Of-Bag）最小樣本數設為 max(5, n×0.15)，避免 OOB 過少導致 R² 無統計意義。CI_low（下界）是否 > 0 是判定模型是否穩定的關鍵閾值。
 
-### 修改腳本
+### 4.3 Trust Grade 分級
 
-將 L75-88 的配置區塊替換為：
+綜合三個指標判定四級信任等級：
 
-```python
-# ============================================================
-# 配置（從 config.yaml 載入，找不到則用預設值）
-# ============================================================
-import yaml as _yaml
+Grade A（可部署）：bias < 0.05 且 Nested R² > 0.3 且 CI_low > 0
+Grade B（可使用）：bias < 0.15 且 Nested R² > 0.2 且 CI_low > -0.2
+Grade D（不可靠）：Nested R² < 0 或 CI_low < -0.4
+Grade C（實驗性）：其餘
 
-_CONFIG_PATH = "/content/drive/MyDrive/台泥/AI/config.yaml"
-try:
-    with open(_CONFIG_PATH, 'r', encoding='utf-8') as f:
-        _cfg = _yaml.safe_load(f)
-    print(f"✓ 載入配置: {_CONFIG_PATH}")
-except Exception:
-    _cfg = {}
-    print(f"⚠ 配置檔不存在，使用預設值")
+v6.4 結果中僅 7 天含 3 天蘇澳達到 Grade A（Nested R² = 0.934, bias = 0.022, CI = [0.882, 0.981]）。
 
-FILE_PATH = _cfg.get('data', {}).get(
-    'file_path', "/content/drive/MyDrive/台泥/AI/水泥XRD(整理後).xlsx")
-USE_OPTUNA = _cfg.get('training', {}).get('use_optuna', True)
-OPTUNA_TRIALS = _cfg.get('training', {}).get('optuna_trials', 30)
-BOOTSTRAP_N = _cfg.get('training', {}).get('bootstrap_n', 200)
-SHAP_ENABLED = _cfg.get('training', {}).get('shap_enabled', True)
-SHAP_OUTPUT_DIR = _cfg.get('output', {}).get(
-    'shap_dir', "/content/drive/MyDrive/台泥/AI/shap_outputs/")
-EXPERIMENT_LOG_PATH = _cfg.get('output', {}).get(
-    'experiment_log',
-    "/content/drive/MyDrive/台泥/AI/experiment_log.csv")
-```
+### 4.4 防過擬合自動選模
 
-需要在腳本頂部新增 `import yaml`，或用 `try/except` 包裹
-（Colab 預裝了 PyYAML）。
+基於 bias 值觸發三種模式：
 
-### 驗證
+Mode A（bias < 0.05）：直接採用 greedy 最佳配置。
+Mode B（0.05-0.15）：從候選中篩選特徵數 ≤ 3 的最佳。
+Mode C（≥ 0.15）：從 Nested LOO 特徵穩定性取 top-1 組合並裁剪到 ≤ 3。
 
-- 有 config.yaml 時從中讀取
-- 沒有 config.yaml 時 fallback 到預設值，行為和原來一致
-- 修改 `optuna_trials: 50` 後重跑，Optuna 確實跑 50 trials
+此設計確保了最終報告的 R² 是基於 Nested LOO 的無偏估計，而非虛高的標準 LOO R²。
 
 ---
 
-## M4：experiment_log.csv
+## 5. 模型選擇
 
-### 問題
+### 5.1 MODEL_ZOO 構成
 
-v6.1 到 v6.4 的歷次結果無法平行比較。
+Ridge（alpha=0.5/1.0/5.0）、ElasticNet（l1_ratio=0.5/0.8）、RandomForest、XGBoost、GradientBoosting、CatBoost（含 Ordered boosting）、LightGBM。
 
-### 修改
+所有模型通過 `_build_model(name, params)` 工廠函數按需創建，避免 CatBoost 的 deepcopy 效能損失。
 
-在主迴圈結尾（pkl 存檔之前，約 L2038）新增：
+### 5.2 Ridge 主導的原因
 
-```python
-    # ★ MLOps M4: 實驗紀錄
-    try:
-        log_rows = []
-        for task_key in TASKS:
-            for side in ['hp', 'sa']:
-                b = final_best[task_key][side]
-                log_rows.append({
-                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'version': 'v6.4',
-                    'data_hash': _data_hash,
-                    'task': task_key,
-                    'factory': side,
-                    'trust_grade': b.get('trust_grade', '?'),
-                    'trust_mode': b.get('trust_mode', '?'),
-                    'nested_r2': round(b.get('nested_r2', 0), 4),
-                    'loo_r2': round(b.get('r2', 0), 4),
-                    'official_r2': round(b.get('official_r2', 0), 4),
-                    'rmse': round(b.get('rmse', 0), 4),
-                    'n_features': len(b.get('features', [])),
-                    'features': str(b.get('features', [])),
-                    'model': b.get('model', '?'),
-                    'bias': round(
-                        b.get('r2', 0) - b.get('nested_r2', 0), 4),
-                    'bootstrap_ci_low': round(
-                        b.get('bootstrap_ci', {}).get('ci_low', 0), 4)
-                        if b.get('bootstrap_ci') else None,
-                })
-        log_df = pd.DataFrame(log_rows)
-        # Append 模式：如果檔案存在就追加，不存在就新建
-        if os.path.exists(EXPERIMENT_LOG_PATH):
-            log_df.to_csv(EXPERIMENT_LOG_PATH, mode='a',
-                          header=False, index=False)
-        else:
-            log_df.to_csv(EXPERIMENT_LOG_PATH, index=False)
-        print(f"✓ 實驗紀錄已追加至: {EXPERIMENT_LOG_PATH} "
-              f"({len(log_rows)} rows)")
-    except Exception as e:
-        print(f"⚠ 實驗紀錄寫入失敗: {e}")
-```
+v6.4 結果中 Ridge 被選為最佳模型 10/12 次。在本系統的小樣本（30-40 筆）、高維度（42 候選特徵）場景下，Ridge 的 L2 正則化能穩定共線性嚴重的特徵矩陣。水泥 ML 研究的系統性回顧指出超過 55% 的相關研究樣本量不到 200 筆，小樣本被認為不足以支撐複雜模型 [7]。CatBoost 的 ordered boosting 雖然理論上抗過擬合，但 30 筆數據的排列組合太少，其優勢無法體現。
 
-### 驗證
+### 5.3 Optuna 貝氏超參數優化
 
-跑完後 Drive 上出現 `experiment_log.csv`，包含 12 行（6 策略 × 2 廠區）。
-第二次跑完後追加 12 行（共 24 行），可用 pandas 讀取比較跨版本差異。
+在最終選定的特徵上，用 Optuna 在 LOO 內做貝氏搜索。搜索空間涵蓋 model_type（ridge/xgb/gb/catboost/lgbm/elasticnet）和各模型特定的超參數。如果 Optuna R² 比固定 Zoo 高 0.005 以上，自動回寫到 STRATEGIES。v6.4 中 28 天 XRD 和平的 Optuna_ridge（alpha=0.103）比固定 Ridge_0.5 提升了 +0.023。
 
 ---
 
-## M5：feature_stats OOD 檢查
+## 6. 可解釋性分析
 
-### 問題
+### 6.1 SHAP（SHapley Additive exPlanations）
 
-預測時如果新數據的 XRD 分布超出訓練範圍，模型會靜默給出錯誤預測。
+SHAP 基於合作博弈論的 Shapley 值，量化每個特徵對單一預測的邊際貢獻 [8]。本系統使用 cross-validated SHAP：在 n ≤ 60 的場景下，每個 LOO fold 訓練模型後只計算留出那一筆的 SHAP 值，最後拼接成完整矩陣。這避免了在全量資料上 fit 後計算 SHAP 可能反映過擬合模式的問題。
 
-### 修改——特徵分析腳本
+輸出包括全域特徵重要性排序（平均絕對 SHAP 值）和 Beeswarm/Bar plot。
 
-在 pkl 的 save_data 中新增（L2044 附近）：
+### 6.2 SHAP Interaction Values（代理模型）
 
-```python
-        # ★ MLOps M5: 訓練數據特徵統計（供 OOD 檢測）
-        'feature_stats': {
-            side: {
-                f: {
-                    'mean': float(fd[f].mean()),
-                    'std': float(fd[f].std()),
-                    'min': float(fd[f].min()),
-                    'max': float(fd[f].max()),
-                }
-                for f in fd.columns
-                if f in fd.select_dtypes(include=[np.number]).columns
-                and fd[f].notna().sum() > 5
-            }
-            for side, fd in [('hp', hp_data), ('sa', sa_data)]
-        },
-```
+由於最佳模型通常是 Ridge（不支援 TreeExplainer），系統用 GradientBoostingRegressor 作為「解釋代理」計算 interaction values。只在代理 R² ≥ 基礎模型 R² × 85% 時才信任。v6.4 中揭示的 top 互動效應包括：SSA_C3A × Calcite（蘇澳 3 天，0.2254）和 7 天 × Str7_C2S（和平 28 天主策略，0.1603）。
 
-### 修改——預測腳本
+### 6.3 Permutation Importance
 
-在 `cement_predict_v6_4.py` 中新增 OOD 檢查函數：
+使用 5-fold CV 的 permutation importance 作為 SHAP 的交叉驗證。與 SHAP 的 top-N 比較（N = min(5, n_features)）判定排序一致性。v6.4 結果中 11/11 個組合達到排序一致（修正 E 後）。
 
-```python
-def check_ood(features_dict, data, factory, threshold=3.0):
-    """
-    檢查輸入特徵是否超出訓練分布。
+### 6.4 三重驗證的意義
 
-    Returns
-    -------
-    list of str — 警告訊息（空 = 正常）
-    """
-    stats = data.get('feature_stats', {}).get(factory, {})
-    if not stats:
-        return []
-
-    warnings = []
-    for f, v in features_dict.items():
-        if f in stats and stats[f]['std'] > 0:
-            s = stats[f]
-            z = abs(v - s['mean']) / s['std']
-            if z > threshold:
-                warnings.append(
-                    f"  ⚠ {f}={v:.2f} 超出訓練範圍 "
-                    f"(z={z:.1f}, 訓練: {s['mean']:.2f}±{s['std']:.2f})")
-            elif v < s['min'] * 0.9 or v > s['max'] * 1.1:
-                warnings.append(
-                    f"  ⚠ {f}={v:.2f} 接近訓練邊界 "
-                    f"(訓練範圍: [{s['min']:.2f}, {s['max']:.2f}])")
-    return warnings
-```
-
-在 `predict_single` 的 L95（點預測之前）加入：
-
-```python
-    # ★ OOD 檢查
-    ood_warnings = check_ood(features_dict, data, factory)
-    if ood_warnings:
-        result['ood_warnings'] = ood_warnings
-```
-
-在 `format_prediction` 中加入顯示：
-
-```python
-    if result.get('ood_warnings'):
-        lines.append("分布異常警告:")
-        for w in result['ood_warnings']:
-            lines.append(w)
-```
-
-### 驗證
-
-用一個極端值（例如 `C3S=95`，正常範圍約 55-75）呼叫 predict_single，
-應該看到 OOD 警告。正常值不應觸發。
+SHAP、Permutation、Interaction 三個完全不同的計算路徑得出一致的特徵重要性排序，極大增強了結果的可信度。如果三者不一致，通常意味著模型對特徵關係的學習不穩定，是過擬合的信號。
 
 ---
 
-## M6：測試 Notebook
+## 7. 不確定性量化
 
-### 新增檔案
+### 7.1 分位數回歸 + Conformal 校準
 
-建立 `/content/drive/MyDrive/台泥/AI/test_v6.4.ipynb`
-（或同等的 .py 腳本）。
+對 28 天策略，使用 GradientBoostingRegressor 的 `loss='quantile'`（alpha=0.10/0.50/0.90）在 LOO 下計算三個分位數預測，構成 80% 預測區間。
 
-以下為 notebook cell 內容：
+原始分位數回歸在小樣本下區間過窄（覆蓋率 64-74%）。系統引入 Conformal Prediction 校準：計算 conformity scores `s_i = max(q10_i − y_i, y_i − q90_i)`，取其 `ceil((1−α)(n+1)/n)` 分位數作為校準幅度 Q，將區間膨脹為 `[q10 − Q, q90 + Q]`。
 
-```python
-# ═══ Cell 1: Setup ═══
-import sys
-sys.path.insert(0, '/content/drive/MyDrive/台泥/AI/')
+這基於 Conformal Prediction 的有限樣本有效性理論。NeurIPS 2024 的 Self-Calibrating Conformal Prediction 將 Venn-Abers 校準從分類擴展到回歸，能在有限樣本下同時提供校準的點預測和具有有限樣本有效性的預測區間 [9]。AAAI 2025 的 Conformal Thresholded Intervals (CTI) 進一步提出用多輸出分位數回歸直接建構最小預測集 [10]。
 
-from cement_feature_analysis_v6_4 import (
-    compute_trust_grade,
-    calculate_features,
-    build_quantile_deviation_model,
-    _build_model,
-    build_pool,
-    TASKS,
-    TRUST_LABELS,
-    MODEL_ZOO_FULL,
-)
+v6.4 結果：校準後覆蓋率全部達到 82-84%，conformal margin 在 0.42-0.79 MPa 之間。
 
-import pandas as pd
-import numpy as np
-passed = 0
-failed = 0
+### 7.2 偏差量化指標
 
+五個核心指標：
 
-# ═══ Cell 2: Trust Grade 邊界測試 ═══
-def test_trust_grade():
-    global passed, failed
-    tests = [
-        # (bias, nested_r2, ci_low, expected_grade)
-        (0.03, 0.80, 0.50, 'A'),   # 低偏差 + 高 R² + CI > 0
-        (0.04, 0.25, 0.05, 'B'),   # 低偏差但低 R²
-        (0.10, 0.50, 0.10, 'B'),   # 中偏差
-        (0.14, 0.21, -0.15, 'B'),  # 邊界 B
-        (0.20, 0.40, 0.05, 'C'),   # 高偏差
-        (0.05, 0.35, -0.10, 'C'),  # CI 偏低但不到 D
-        (0.02, -0.10, 0.10, 'D'),  # 負 R²
-        (0.05, 0.30, -0.50, 'D'),  # CI 太低
-        (0.01, 0.80, -0.45, 'D'),  # 其餘好但 CI 崩潰
-    ]
-    for bias, r2, ci_low, expected in tests:
-        ci = {'ci_low': ci_low}
-        result = compute_trust_grade(bias, r2, ci)
-        if result == expected:
-            passed += 1
-        else:
-            failed += 1
-            print(f"  ✗ trust_grade({bias}, {r2}, {ci_low}) "
-                  f"= {result}, expected {expected}")
-    print(f"Trust Grade: {len(tests)} tests, "
-          f"{passed} passed, {failed} failed")
+覆蓋率：80% 區間包含多少比例的實際值（目標 ≥ 80%）。
+平均區間寬度：區間的平均 MPa 寬度（越窄越好，但不能犧牲覆蓋率）。
+偏差方向正確率：模型預測的偏差方向（高/低於廠區平均）和實際一致的比例（> 50% 才有價值）。
+偏差相關性：偏差分數和實際偏差的 Pearson r。
+極端值辨識力：模型標記為「偏低 20%」的批次，實際平均強度比其他批次低多少 MPa（> 1 MPa 為可辨識）。
 
-test_trust_grade()
-
-
-# ═══ Cell 3: 特徵工程回歸測試 ═══
-def test_features():
-    global passed, failed
-    row = pd.DataFrame([{
-        'C3S': 60, 'C2S': 15, 'C4AF': 10,
-        'C3A_cubic': 5, 'C3A_ortho': 3,
-        'FreeLime': 1.0, 'Calcite': 2.0,
-        'Gypsum': 3.0, 'Bassanite': 1.0, 'Anhydrite': 0.5,
-        '比表面積': 3500, '濕式f-CaO': 1.2,
-        '3天': 25.0, '7天': 32.0, '28天': 42.0,
-    }])
-    r = calculate_features(row)
-
-    checks = [
-        ('C3A_total', 8.0),
-        ('Sulfate_total', 4.5),
-        ('Silicate_total', 75.0),
-        ('Hydraulic_potential',
-         60*1.0 + 15*0.2 + 5*0.8 + 3*0.4 + 10*0.15),
-        ('Heat_est',
-         136*60/100 + 62*15/100 + 200*8/100 + 30*10/100),
-        ('Burning_degree', 60 / (60 + 15 + 0.001)),
-        ('Strength_gain_3to7', 7.0),
-    ]
-    for name, expected in checks:
-        actual = r[name].iloc[0]
-        if abs(actual - expected) < 0.01:
-            passed += 1
-        else:
-            failed += 1
-            print(f"  ✗ {name} = {actual:.4f}, expected {expected:.4f}")
-
-    # C-1: 沒有 K2O → 不應生成 Na2Oeq
-    if 'Na2Oeq' not in r.columns:
-        passed += 1
-    else:
-        failed += 1
-        print("  ✗ Na2Oeq should not exist without K2O")
-
-    # C-2: 沒有 C3S_M1 → 不應生成 C3S_M1_ratio
-    if 'C3S_M1_ratio' not in r.columns:
-        passed += 1
-    else:
-        failed += 1
-        print("  ✗ C3S_M1_ratio should not exist without C3S_M1")
-
-    print(f"特徵工程: {len(checks)+2} checks, "
-          f"{passed} passed, {failed} failed")
-
-test_features()
-
-
-# ═══ Cell 4: _build_model 工廠函數測試 ═══
-def test_build_model():
-    global passed, failed
-    for name in ['Ridge_0.5', 'Ridge_1.0', 'Ridge_5.0',
-                 'ENet_0.5', 'XGB_Small', 'GB_Stable']:
-        if name in MODEL_ZOO_FULL:
-            try:
-                m = _build_model(name,
-                                 MODEL_ZOO_FULL[name]['params'])
-                # 確認能 fit 和 predict
-                X = np.random.randn(10, 3)
-                y = np.random.randn(10)
-                m.fit(X, y)
-                pred = m.predict(X[:1])
-                assert len(pred) == 1
-                passed += 1
-            except Exception as e:
-                failed += 1
-                print(f"  ✗ _build_model('{name}'): {e}")
-    print(f"_build_model: {passed} passed, {failed} failed")
-
-test_build_model()
-
-
-# ═══ Cell 5: Conformal 覆蓋率保證測試 ═══
-def test_conformal():
-    global passed, failed
-    np.random.seed(42)
-    for trial in range(3):
-        n = 40
-        X = np.random.randn(n, 2)
-        y = X[:, 0] * 3 + X[:, 1] * 1.5 + np.random.randn(n) * 2
-        fd = pd.DataFrame(X, columns=['f1', 'f2'])
-        fd['target'] = y
-        result = build_quantile_deviation_model(
-            fd, ['f1', 'f2'], 'target', label=f'test_{trial}')
-        if result and result['calibrated_coverage'] >= 0.75:
-            passed += 1
-        else:
-            cov = result['calibrated_coverage'] if result else 0
-            failed += 1
-            print(f"  ✗ trial {trial}: coverage={cov:.1%}")
-    print(f"Conformal: 3 trials, "
-          f"{passed} passed, {failed} failed")
-
-test_conformal()
-
-
-# ═══ Cell 6: build_pool 過濾測試 ═══
-def test_build_pool():
-    global passed, failed
-    # 建一個 mock DataFrame
-    fd = pd.DataFrame({
-        'C3S': [60]*10, 'C2S': [15]*10, 'C4AF': [10]*10,
-        'C3A_cubic': [5]*10, 'C3A_ortho': [3]*10,
-        'FreeLime': [1]*10, 'Calcite': [2]*10,
-        'Gypsum': [3]*10, 'Bassanite': [1]*10, 'Anhydrite': [0.5]*10,
-        '比表面積': [3500]*10, '濕式f-CaO': [1.2]*10,
-        '3天': [25]*10, '7天': [32]*10, '28天': [42]*10,
-        # 以下是 calculate_features 會生成的欄位
-        'C3A_total': [8]*10, 'SSA_C3S': [210]*10,
-        'Na2Oeq': [None]*10,  # 全 NaN → 應被過濾
-    })
-
-    pool = build_pool(fd, '28天', include_strength=False, side='hp')
-    # Na2Oeq 全 NaN → 不應出現在 pool 中
-    if 'Na2Oeq' not in pool:
-        passed += 1
-    else:
-        failed += 1
-        print("  ✗ Na2Oeq should be filtered (all NaN)")
-
-    # 28天_含3天: allowed_strength 應排除 7天
-    pool_3d = build_pool(fd, '28天', include_strength=True,
-                          side='hp',
-                          allowed_strength=['3天', 'Str3_EffBurn'])
-    if '7天' not in pool_3d:
-        passed += 1
-    else:
-        failed += 1
-        print("  ✗ 7天 should be excluded by allowed_strength")
-
-    if '3天' in pool_3d:
-        passed += 1
-    else:
-        failed += 1
-        print("  ✗ 3天 should be in pool with allowed_strength")
-
-    print(f"build_pool: 3 checks, "
-          f"{passed} passed, {failed} failed")
-
-test_build_pool()
-
-
-# ═══ Cell 7: 總結 ═══
-print(f"\n{'=' * 50}")
-print(f"總計: {passed} passed, {failed} failed")
-if failed == 0:
-    print("✓ 全部通過")
-else:
-    print(f"✗ {failed} 項失敗，請檢查")
-print(f"{'=' * 50}")
-```
-
-### 使用方式
-
-在 Colab 中新建一個 notebook，貼入上述 cells，執行即可。
-全部測試應在 15 秒內完成。每次改版前跑一次確認沒有回歸。
+蘇澳 28 天 XRD 雖然 Grade D（Nested R² = 0.336），但方向正確率 81%、偏差相關性 0.694、極端值辨識力 +3.64 MPa，對混合決策有顯著實務價值。
 
 ---
 
-## 不修改的部分
+## 8. Multi-Task Learning
 
-- 所有 v6.4 的計算邏輯（Nested LOO, Trust Grade, SHAP, Optuna, MTL, MAML）
-- calculate_features 的公式
-- build_pool 的過濾規則
-- 主迴圈的執行順序
-- 預測腳本的 Grade 分層邏輯
+使用 `sklearn.multioutput.MultiOutputRegressor(Ridge)` 同時預測 3 天/7 天/28 天強度，共享 XRD 特徵空間。
+
+MTL 的理論基礎是任務間的共享結構：三個齡期的強度來自同一套水泥晶相的水化過程，物理上存在因果鏈（C3S 水化 → 3 天 → 繼續水化 → 7 天 → C2S 參與 → 28 天）。研究表明 MTL 能利用不同目標之間的共享資訊提升各個目標的預測精度 [11]。
+
+v6.4 結果顯示弱任務獲益最大：和平 7 天從 0.342 提升到 0.496（+0.154），和平 28 天從 0.152 到 0.221（+0.068）。強任務（蘇澳 3 天 0.793）幾乎不受影響（+0.007）。
 
 ---
 
-## 依賴關係
+## 9. MAML 跨廠區遷移（實驗性）
 
-```
-M1 (if __name__) ── 最先做，M6 依賴它
-M2 (數據指紋) ───── 獨立，M4 需要 _data_hash
-M3 (config.yaml) ── 獨立
-M5 (OOD 檢查) ──── 獨立
-M4 (實驗紀錄) ──── 依賴 M2 的 _data_hash
-M6 (測試 notebook) ─ 依賴 M1 的 if __name__ 保護
-```
+Ridge-MAML 將每個（廠區, 齡期）組合視為一個 task，學習跨 task 的共享權重初始化，然後每個 task 用 3 步梯度下降適應。基於 MAML（Model-Agnostic Meta-Learning）框架 [12]，2025 年研究已證明 few-shot meta-learning 在資料受限的混凝土強度預測中的有效性 [13]。
 
-M1/M2/M3/M5 可平行開發。M4 等 M2 完成。M6 等 M1 完成。
+v6.4 結果全面退步（-0.10 到 -0.38），根本原因是兩廠 XRD 分布差異太大（不同原料、窯型、混合比例），共享初始化造成負遷移。標記為「不適用於當前兩廠場景」，保留代碼待未來廠區數量增加時重新評估。
+
+---
+
+## 10. 部署架構
+
+### 10.1 分層預測
+
+預測腳本根據 Trust Grade 自動決定輸出格式：
+
+Grade A：80% 預測區間，無警告。
+Grade B：90% 預測區間，無警告。
+Grade C：95% 預測區間 + 「僅供參考」警告。
+Grade D：不輸出點預測，只給偏差方向和 conformal 校準後的區間。
+
+### 10.2 OOD 檢查
+
+預測時檢查每個輸入特徵的 z-score 是否 > 3（超出訓練分布）以及是否低於 min×0.9 或高於 max×1.1（接近訓練邊界）。警告自動附加到預測結果中。
+
+### 10.3 MLOps 基礎設施
+
+數據指紋：每次載入 Excel 後計算 MD5 hash，存入 pkl，確保模型和數據版本綁定。
+pkl 版本化：檔名帶指紋和時間戳，同時維護一個 latest 副本。
+實驗紀錄：每次跑完追加到 experiment_log.csv，支持跨版本追蹤比較。
+配置分離：config.yaml 管理路徑和超參數，不存在時 fallback 到預設值。
+測試腳本：46 項自動化測試覆蓋核心函數的正確性。
+
+---
+
+## 11. 已知限制
+
+28 天 XRD-only 預測能力不足（和平 Nested R² = 0.152，蘇澳 0.336），根本原因是 XRD 晶相和 28 天強度之間的因果鏈太長。水泥成品由不同製程批次的熟料混合磨細而成，batch-level 的製程參數在混合後被平均掉，XRD 測到的是「混合後的平均結晶相組成」，已是距離 28 天強度最近的可測量信號。
+
+樣本量限制（和平 40 筆、蘇澳 31 筆）導致 tree-based 模型無法發揮優勢，Ridge 壓倒性勝出。當樣本累積到 80-100 筆時應重新評估模型選擇。
+
+ElasticNet 僅在 28 天含 3 天蘇澳的 Nested LOO 內層被大量選中（13/31 次），其餘場景 Ridge 仍然最優。
+
+---
+
+## 參考文獻
+
+[1] Taylor, H.F.W. (1997). Cement Chemistry, 2nd ed. Thomas Telford Publishing. — Portland 水泥化學基礎，Bogue 計算，水化熱係數。
+
+[2] Andrade Neto, J.S., Carvalho, I., Monteiro, P.J.M., & Kirchheim, A.P. (2025). "Unveiling the key factors for clinker reactivity and cement performance: A physic-chemical and performance investigation of 40 industrial clinkers." Cement and Concrete Research, 187, 107726. — 40 個工業熟料的系統性研究，硫酸鹽-鹼比對 C3A 多晶型和 Alite 晶體大小的影響，Alite 晶體大小對早期強度的負面效應。
+
+[3] Kamakshi, T.A., et al. (2024). "Impact of particle size, clinker mineralogy and sulfate availability on early cement hydration." Cement and Concrete Research, 184, 107611. — 硫酸鹽供應不足導致 C3A 不受控水化和 C3S 水化延遲。
+
+[4] Andrade Neto, J.S., et al. (2024). C3S 多晶型研究：M1 多晶型與 portlandite 生成的關聯，C3S 形成受硫酸鹽/鎂比和 Na₂Oeq 控制。（見 [2] 同一研究組）
+
+[5] Vabalas, A., Gowen, E., Poliakoff, E., & Casson, A.J. (2019). "Machine learning algorithm validation with a limited sample size." PLOS ONE, 14(11), e0224365. — 證實 K-fold CV 在小樣本下產生嚴重樂觀偏差，Nested CV 和 train/test split 產生穩健無偏估計。
+
+[6] Nawabi, J., et al. (2026). "A Reproducible Framework for Bias-Resistant Machine Learning on Small-Sample Data." arXiv:2602.02920. — 嚴格 nested CV 框架，傳統 CV 可能膨脹效能指標超過 20%，提出 leakage-controlled 驗證流程。
+
+[7] 多篇水泥 ML 系統性回顧研究，包括 Concrete ML 領域超過 55% 的研究樣本量不到 200 筆。
+
+[8] Lundberg, S.M. & Lee, S.I. (2017). "A Unified Approach to Interpreting Model Predictions." Advances in Neural Information Processing Systems 30 (NeurIPS 2017). — SHAP 框架原始論文。
+
+[9] van der Laan, L., et al. (2024). "Self-Calibrating Conformal Prediction." Advances in Neural Information Processing Systems 37 (NeurIPS 2024). arXiv:2402.07307. — 將 Venn-Abers 校準從分類擴展到回歸，提供校準點預測和具有限樣本有效性的條件預測區間。
+
+[10] Luo, R., et al. (2025). "Conformal Thresholded Intervals for Efficient Regression." Proceedings of AAAI 2025. arXiv:2407.14495. — 多輸出分位數回歸建構最小預測集，透過 conformity scores 自動調整區間寬度達到目標覆蓋率。
+
+[11] 多篇 MTL 應用於混凝土強度預測的研究，包括：Optimization and predictive performance of fly ash-based sustainable concrete using integrated multitask deep learning framework. Scientific Reports 15, 30820 (2025). — MTL 框架結合 XGBoost、DNN 和 AutoGluon，同時預測抗壓和抗拉強度，R² = 0.91。
+
+[12] Finn, C., Abbeel, P., & Levine, S. (2017). "Model-Agnostic Meta-Learning for Fast Adaptation of Deep Networks." Proceedings of the 34th International Conference on Machine Learning (ICML 2017). — MAML 原始論文。
+
+[13] Few-shot meta-learning for concrete strength prediction, AI in Civil Engineering (2025). — MAML 在混凝土標準數據集的小子集（低至 50 筆）上驗證了 meta-learning 在資料受限場景的有效性。
